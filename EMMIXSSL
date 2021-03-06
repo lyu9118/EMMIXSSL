@@ -1,0 +1,464 @@
+#convert cluster into indicator matrix of cluster
+makelabelmatrix <- function(clust){
+  n <- length(clust)
+  g <- max(clust)
+  Z <- matrix(0, n, g)
+  index <- cbind(1:n, clust)
+  Z[index] <- 1
+  return(Z)
+}
+#generate randon observations from the gaussian mixture distributions
+rmix <- function(n,pi, mu, sigma,ncov=2){
+  g=length(pi)
+  if(ncov==1){
+    nn<-table(sample(1:g, n, replace = TRUE, prob = pi))
+    p=dim(mu)[1]
+    X=NULL
+    for(j in 1:g){
+      if (nn[j] > 0){
+        X1<- mvtnorm::rmvnorm(nn[j], mean=mu[,j], sigma=as.matrix(sigma)) # group 1 :a random number generator for the multivariate normal distribution 
+        X=rbind(X,X1)
+      } else if (nn[j]==0){
+        X1=matrix(NA,nn[j],p)
+        X=rbind(X,X1)
+      }
+    }  }else{
+    nn<-table(sample(1:g, n, replace = TRUE, prob = pi))
+    p=dim(mu)[1]
+    X=NULL
+    for(j in 1:g){
+      if (nn[j] > 0){
+        X1<- mvtnorm::rmvnorm(nn[j], mean=mu[,j], sigma=as.matrix(sigma[,,j])) # group 1 :a random number generator for the multivariate normal distribution 
+        X=rbind(X,X1)
+      } else if (nn[j]==0){
+        X1=matrix(NA,nn[j],p)
+        X=rbind(X,X1)
+      }
+    }
+    }
+    y <- rep(1:g,nn)
+    rperm <- sample(n) #re-arrange order
+    y <- y[rperm]
+    X <- X[rperm,,drop=FALSE]
+    clust<-y
+    Y<-X
+    Z<-makelabelmatrix(y)
+    dat <- list(Y=Y,Z=Z,clust=clust)
+  
+  return(dat)
+}
+
+normalise_logprob <- function(x){
+  x <- exp(x-max(x))
+  return(x/sum(x))
+}
+
+logsumexp <- function(x){
+  log(sum(exp(x - max(x)))) + max(x)
+}
+
+#the posterior probability, tau
+get_clusterprobs <- function(dat, n, p, g, mu, sigma, dof=NULL, delta=NULL, pi,ncov=2){
+  logdens<-matrix(0,n,g)
+  if(ncov==1){
+    for(i in 1:g){
+      logdens[,i]<-mvtnorm::dmvnorm(dat,mean=mu[,i],sigma = as.matrix(sigma),log=TRUE)
+    }
+  }else{
+    for(i in 1:g){
+      logdens[,i]<-mvtnorm::dmvnorm(dat,mean=mu[,i],sigma = as.matrix(sigma[,,i]),log=TRUE)
+    }
+  }
+  #logdens <- ddmix(dat=dat, n=n, p=p, g=g, distr=distr, mu=mu, sigma=sigma, dof=dof, delta=delta)
+  logprobs <- t(t(logdens)+log(pi))
+  clusprobs <- t(apply(logprobs, 1, normalise_logprob))
+  return(clusprobs)
+}
+
+#entropy=-tau*log tau
+get_entropy <- function(dat, n, p, g, mu, sigma, dof=NULL, delta=NULL, pro,ncov=2){
+  tau <- get_clusterprobs(dat, n, p, g, mu, sigma,pi=pro,ncov)
+  entropy <- apply(tau, 1, function(x) sum(ifelse(x==0, 0,-x*log(x))))
+  return(entropy)
+}
+
+#generate the missing label indicator based on d^2 or entropy en
+rlabel <- function(X, pi, mu, sigma, xi,ncov=2){
+  n <- nrow(X)
+  g<-length(pi)
+  p<-dim(mu)[1]
+   if(ncov==1){
+    if(g==2){
+      betapar <- discriminant_beta(pi, mu, sigma)
+      beta0 <- betapar$beta0
+      beta <- betapar$beta
+      omega <- beta0 + X %*% beta  # should be t(beta)%*%X
+      eta <- xi[1] + xi[2]*omega^2  #replace the entropy by the square the discriminant function d()
+      rmu <- 1/(1+exp(-eta))
+      m <- rbinom(n, size=1, prob=rmu)
+      }else{
+        sigma1<-array(0,dim=c(p,p,g))
+        for(i in 1:g){
+          sigma1[,,i]=sigma
+        }
+        dfun=get_entropy(dat=X, n=n, p=p, g=g,mu=mu, sigma=sigma1,pro=pi)
+        eta=xi[1]+xi[2]*((dfun))
+        rmu <- 1/(1+exp(-eta))
+        m <- rbinom(n, size=1, prob=rmu)
+        }
+  }else{
+      dfun=get_entropy(dat=X, n=n, p=p, g=g, mu=mu, sigma=sigma,pro=pi)
+      eta=xi[1]+xi[2]*((dfun))  
+      rmu <- 1/(1+exp(-eta))
+      m <- rbinom(n, size=1, prob=rmu)
+  }
+    return(m)
+  }
+
+initialvalue1 <- function(g,zm, Y,ncov=2){
+  #labelled indicators
+  k<-zm[is.na(zm)==FALSE]
+  Y<-as.matrix(Y)
+  p<- ncol(Y)
+  # labelled observations
+  Y<-as.matrix(Y[is.na(zm)==FALSE,])
+  # the number of labelled observation
+  n <- length(k)
+  nn=NULL
+  pi=NULL
+  mu <- matrix(0, p, g)
+  sigmaa<-array(0,dim=c(p,p,g))
+  for(i in 1:g){
+    nn[i]<-sum(k==i)  
+    pi[i]<-nn[i]/n
+    mu[,i]<-apply(as.matrix(Y[k==i,]),2,mean)
+    mu[,i][is.nan(mu[,i])]=1
+    sigmaa[,,i] <- t(Y[k==i,]-mu[,i])%*%((Y[k==i,])-mu[,i])
+  }
+  if(ncov==1){
+    sigma<-apply(sigmaa,c(1,2),sum)
+    sigma<-sigma/n
+  }else{
+    for(j in 1:g){
+      sigmaa[,,j]<-sigmaa[,,j]/nn[j]
+    }
+    sigma<-sigmaa
+  }
+  nandef<-sapply(1:g,function(j)any(is.nan(sigmaa[,,j])))
+  sigma[,,nandef]<-diag(1,p)
+  postivedef<-sapply(1:g,function(j)is.positive.definite(sigma[,,j]))
+  sigma[,,postivedef==FALSE]<-diag(1,p)
+  
+  return(list(pi=pi, mu=mu, sigma=sigma))
+}
+
+initialvalue <- function(g,zm, Y,ncov=2){
+  p<- ncol(Y)
+  a<-p*g
+  pi<-rep(1/g,g)
+  vec<-c(1:a)/g
+  mu<-matrix(vec,p,g)
+  sigma<-array(0,dim=c(p,p,g))
+  for(u in 1:g){
+    sigma[,,u]=diag(u,p)  
+  }
+  return(list(pi=pi, mu=mu, sigma=sigma))
+  
+}
+
+
+#Sigma=R^T%*%R
+cov2vec <- function(sigma){
+  R <- chol(sigma)
+  upper_elements <- R[upper.tri(R, diag=FALSE)]
+  diag_elements <- diag(R)
+  return(c(log(diag_elements), upper_elements)) # why return log for diag elements but not for upper elements???
+}
+
+#transform a vector into a variance matrix
+vec2cov <- function(par){
+  q <- length(par)
+  p <- (-1+sqrt(1+4*1*2*q))/2
+  R <- matrix(0, p,p)
+  diag_elements <- par[1:p]
+  upper_elements <-par[-(1:p)]
+  diag(R) <- exp(diag_elements)
+  if (any(is.infinite(R) | is.nan(R))) stop('Variances infinite or NaN')
+  R[upper.tri(R)] <- upper_elements
+  sigma <- t(R) %*% R
+  if(any(eigen(sigma)$values <= 0)) stop('Conversion failed (negative eigenvalues)')
+  return(sigma)
+}
+
+pro2vec <- function(pro){
+  g <- length(pro)
+  z <- numeric(g)
+  z[1] <- pro[1]
+  for (h in 2:g){
+    z[h] <- pro[h]/(1-sum(pro[1:(h-1)]))
+  }
+  z <- z[-g]
+  y <- log(z/(1-z))-log(1/(g-1:(g-1)))
+  return(y)
+}
+
+vec2pro <- function(vec){
+  g <- length(vec)+1
+  pro <- numeric(g)
+  z <- numeric(g)
+  for (h in 1:(g-1)){
+    z[h] <- 1/(1+exp(-vec[h]-log(1/(g-h))))
+  }
+  pro[1] <- z[1]
+  if (g > 2){
+    for (h in 2:(g-1)){
+      pro[h] <- (1-sum(pro[1:(h-1)]))*z[h]
+    }
+  }
+  pro[g] <- 1-sum(pro[-g])
+  return(pro)
+}
+
+list2par <- function(pi,mu,sigma,xi=NULL, g, p,type=c('ign','full'),ncov=2){
+  if(ncov==1){
+    muvec <- as.vector(mu)
+    q <- p*(p+1)/2
+    cholpars <- numeric(q)
+    cholvec <- cov2vec(sigma)
+    pi <- pi
+    tpro <- pro2vec(pi)
+    if (type=='ign'){
+      par <- c(muvec, cholvec, tpro)
+    } else if (type=='full'){
+      par <- c(muvec, cholvec, tpro,xi)
+    }
+    }else{
+    muvec <- as.vector(mu)#put all mu vectors into one vector
+    q <- p*(p+1)/2 #the number of upper_elements and diagonal elements in variance matrix  
+    cholpars <- matrix(0, q, g) #generate matrix with g clusters and each cluster including q variance components
+    for (h in 1:g){
+      cholpars[,h] <- cov2vec(sigma[,,h]) # put the i-th cluster upper elements and diagonal elements into the i-th vector
+    }
+    cholvec <- as.vector(cholpars) #put the matrix into one vector
+    pi <- pi
+    tpro <- pro2vec(pi)
+    
+    if (type=='ign'){
+      par <- c(muvec, cholvec, tpro)
+    } else if (type=='full'){
+      par <- c(muvec, cholvec, tpro,xi)
+    }
+  }
+  return(par)
+}
+
+par2listnc1 <- function(par, p, type=c('ign', 'full', 'known')){
+  mu <- matrix(par[1:(p*2)], p, 2)
+  par <- par[-(1:(2*p))]
+  q <- p*(p+1)/2
+  cholpars <- par[1:(q*1)]
+  sigma <- matrix(0,p,p)
+  sigma <- vec2cov(cholpars)
+  par <- par[-(1:(q))]
+  tpro <- par[1]
+  pi <- vec2pro(tpro)
+  parlist <- list(pi=pi, mu=mu, sigma=sigma)
+  if (type=='full'){
+    parlist$xi <- par[-1]
+  }
+  return(parlist)
+}
+
+par2list <- function(par, g, p,type=c('ign','full'),ncov=2){
+  if(ncov==1){
+    parlist<-par2listnc1(par=par, p=p, type)
+  }else{
+    mu <- matrix(par[1:(p*g)], p, g)
+    par <- par[-(1:(p*g))]
+    q <- p*(p+1)/2
+    cholpars <- matrix(par[1:(q*g)], q, g)
+    sigma <- array(0, dim=c(p,p,g))
+    for (h in 1:g){
+      sigma[,,h] <- vec2cov(cholpars[,h])
+    }
+    par <- par[-(1:(q*g))]
+    tpro <- par[1:(g-1)]
+    pi=vec2pro(tpro)
+    par <- par[-(1:(g-1))]
+    parlist <- list( pi=pi,mu=mu, sigma=sigma)
+    if (type=='full'){
+      parlist$xi <- par
+    }
+  }
+  return(parlist)
+}
+
+#calculate beta0 and beta1
+discriminant_beta <- function(pi, mu, sigma){
+  isigma <- solve(sigma)
+  beta0 <- log(pi[1])-log(pi[2])-1/2*(t(mu[,1]) %*% isigma %*% mu[,1] -t(mu[,2]) %*% isigma %*% mu[,2])
+  beta0 <- as.numeric(beta0)
+  beta <-  isigma %*% (mu[,1]-mu[,2])
+  return(list(beta0=beta0, beta=beta))
+}
+
+
+#zm denotes label as 1 and 2and unlableled as NA
+# log likelihood L_pc^(ig)
+loglk_ig <- function(zm, Y, pi, mu, sigma,ncov=2){
+  g<-length(pi)
+  ni<-NULL
+  grp<-NULL
+  for(i in 1:g){
+    ni[i]<-sum(zm==i, na.rm=TRUE)
+  }
+  nmiss <- sum(is.na(zm))
+  if(ncov==1){
+    for(ii in 1:g){
+      if(ni[i]>0){
+        grp[ii] <- sum(mvtnorm::dmvnorm(Y[which(zm==ii),,drop=FALSE], mean=mu[,ii,drop=FALSE], sigma=as.matrix(sigma), log=TRUE))+ni[ii]*log(pi[ii])
+      }else{
+        grp[ii]<-0
+      }
+    }
+    lablk<-sum(grp)
+    if(nmiss>0){
+      D <- matrix(0, nmiss,g)
+      for(j in 1:g){
+        D[,j] <- mvtnorm::dmvnorm(Y[which(is.na(zm)),,drop=FALSE], mean=mu[,j,drop=FALSE], sigma=as.matrix(sigma), log=TRUE)+log(pi[j])
+      }
+      unlablk <- sum(apply(D, 1, logsumexp))
+    }else {
+      unlablk <- 0
+    }
+  }else{
+    for(ii in 1:g){
+      if(ni[i]>0){
+        grp[ii] <- sum(mvtnorm::dmvnorm(Y[which(zm==ii),,drop=FALSE], mean=mu[,ii,drop=FALSE], sigma=as.matrix(sigma[,,ii]), log=TRUE))+ni[ii]*log(pi[ii])
+      }else{
+        grp[ii]<-0
+      }
+    }
+    lablk<-sum(grp)
+    if(nmiss>0){
+      D <- matrix(0, nmiss,g)
+      for(j in 1:g){
+        D[,j] <- mvtnorm::dmvnorm(Y[which(is.na(zm)),,drop=FALSE], mean=mu[,j,drop=FALSE], sigma=as.matrix(sigma[,,j]), log=TRUE)+log(pi[j])
+      }
+      unlablk <- sum(apply(D, 1, logsumexp))
+    }else {
+      unlablk <- 0
+    }
+  }
+  lk <- lablk+unlablk
+  
+  return(lk)
+}
+
+
+
+# log likelihood L_pc^(miss)
+loglk_miss<- function(zm,Y,xi,pi,mu,sigma,ncov=2){
+  n <- nrow(Y)
+  g<-length(pi)
+  p<-dim(mu)[1]
+  if(ncov==1){
+    if(g==2){
+      betapar <- discriminant_beta(pi, mu, sigma)
+      beta0 <- betapar$beta0
+      beta <- betapar$beta
+      omega <- beta0 + as.vector(Y %*% beta)
+      eta <- xi[1] + xi[2]*omega^2
+    }else{
+      sigma1<-array(0,dim=c(p,p,g))
+      for(i in 1:g){
+        sigma1[,,i]=sigma
+      }
+      dfun=get_entropy(dat=Y, n=n, p=p, g=g,  mu=mu, sigma=sigma1,pro=pi)
+      eta=xi[1]+xi[2]*((dfun))
+    }
+  }else{
+    dfun=get_entropy(dat=Y, n=n, p=p, g=g, mu=mu, sigma=sigma,pro=pi)
+    eta=xi[1]+xi[2]*((dfun))   ###############change the square of the discriminant funtion to to entropy
+    #    }
+  }
+  m <- as.numeric((is.na(zm)))
+  n1 <- sum(m==1)
+  n2 <- sum(m==0)
+  if (n1 > 0){
+    lk1 <- sum(-sapply(eta[m==1], function(x) logsumexp(c(0, -x))))
+  } else {
+    lk1 <- 0
+  }
+  if (n2 > 0){
+    lk0 <- sum(-sapply(eta[m==0], function(x) logsumexp(c(0, x))))
+  } else {
+    lk0 <- 0
+  }
+  lk <- lk1+lk0
+  return(lk)
+}
+
+
+#log likelihood L_pc^(full)
+loglk_full<-function(zm,Y,pi,mu,sigma,xi,ncov=2){
+  lk_pc_ig<-loglk_ig(zm,Y,pi,mu,sigma,ncov)
+  lk_pc_miss<-loglk_miss(zm,Y,xi,pi,mu,sigma,ncov)
+  lk_pc_full<-lk_pc_ig+lk_pc_miss
+  return(lk_pc_full)
+}
+
+
+neg_objective_function1<- function(par, g,y, X, type=c('ign', 'full'), xi0=NULL){
+  zm=y
+  p <- ncol(X)
+  parlist <- par2list(par=par,g=g, p=p, type = type,ncov=1)
+  pi <- parlist$pi
+  mu <- parlist$mu
+  sigma <- parlist$sigma
+  if (type=='ign'){
+    val <- loglk_ig(zm=y, Y=X, pi=pi, mu=mu, sigma=sigma,ncov=1)
+  } else{
+    xi=parlist$xi
+    val=loglk_full(zm=y,Y=X,pi=pi,mu=mu,sigma=sigma,xi=xi,ncov=1)
+  } 
+  return(-val)
+}
+
+neg_objective_function<-function(par,g,zm,Y,type=c('ign','full'),xi0=NULL,ncov=2){
+  g<-g
+  if(ncov==1){
+    val=-neg_objective_function1(par=par, g=g,y=zm,X=Y, type, xi0=xi0)
+  }else{
+    p <- ncol(Y)
+    parlist <- par2list(par,g,p, type = type,ncov)
+    pi=parlist$pi
+    mu=parlist$mu
+    sigma=parlist$sigma
+    if (type=='ign'){
+      val=loglk_ig(zm, Y, pi, mu, sigma,ncov)
+    } else{
+      xi=parlist$xi
+      val=loglk_full(zm,Y,pi,mu,sigma,xi,ncov)
+    }
+  }
+  return(-val)
+}
+
+EMMIXSSL<-function(pi,mu,sigma,zm,xi=NULL,Y,type,ncov,iter.max=500,eval.max=500,rel.tol=1e-15,sing.tol=1e-20){
+  g<-length(pi)
+  p=dim(Y)[2]
+  par<-list2par(pi=pi,mu=mu,sigma=sigma,xi=xi,p=p,g=g,type=type,ncov=ncov)
+  fullopt<-nlminb(start=par,objective=neg_objective_function,gradient = NULL, hessian = NULL,g=g,zm=zm,Y=Y,type=type,ncov=ncov,control=list(iter.max=500, eval.max=500, rel.tol=1e-15, sing.tol=1e-20))
+  parhat<-par2list(fullopt$par,g,p,type=type,ncov=ncov)
+  parlist<-list(objective=fullopt$objective,convergence=fullopt$convergence,iteration=fullopt$iterations,parhat=parhat)
+  return(parlist)
+}
+
+error_rate1=function(m,zm,rule){
+  q=rep(Inf,length(m))
+  q[zm!=rule]=1
+  q[zm==rule]=0
+  err_rate=sum(m*q)/sum(m)
+  return(err_rate)
+}
